@@ -10,7 +10,8 @@
 //! - ん (the moraic nasal) is a note of its own, sung on a nasal that takes the place of the next
 //!   mora's consonant: [m] before p b m, [n] before t d n ts dz ɾ, [ɲ] before tɕ dʑ, [ŋ] before
 //!   k g, and the uvular [ɴ] before a vowel, a glide, a fricative or at the end.
-//! - っ (the geminate) is no note: the next mora's consonant is held longer (Segment::length).
+//! - っ (the geminate) is no note: the next mora's consonant is held longer (Segment::length,
+//!   [`GEMINATE`] times).
 //! - ー (the long vowel mark) continues the vowel before it on a new note, as `-` does.
 //! - Voiceless stops aspirate a little at the start of a word and not inside it, as Japanese
 //!   stops do (word-initial VOT about 30–50 ms, medial about 10–25 ms).
@@ -163,6 +164,12 @@ fn moraic_nasal(next: Option<&str>) -> &'static str {
 
 const VOICELESS_STOPS: [&str; 4] = ["p", "t", "k", "ts"];
 
+/// How many times its own length the consonant after っ is held. A sung mora is long, so the
+/// closure must be long against it: at 90 bpm, 2.5 times (a 145 ms closure, speech's ratio) was
+/// heard as a single consonant by Whisper medium and large-v3 (まって as まて), and 4 times (240 ms)
+/// as the geminate. A fast note squeezes it like any onset.
+const GEMINATE: f64 = 4.0;
+
 /// One kana word → one syllable per mora.
 pub fn word_syllables(word: &str) -> Vec<Syllable> {
     let ms = moras(word);
@@ -184,7 +191,7 @@ pub fn word_syllables(word: &str) -> Vec<Syllable> {
                         }
                     }
                     if *geminate {
-                        s.length = Some(2.5);
+                        s.length = Some(GEMINATE);
                     }
                     onset.push(s);
                 }
@@ -274,7 +281,7 @@ mod tests {
         let s = word_syllables("きって");
         assert_eq!(s.len(), 2);
         assert_eq!(s[1].onset[0].ipa, "t");
-        assert_eq!(s[1].onset[0].length, Some(2.5));
+        assert_eq!(s[1].onset[0].length, Some(GEMINATE));
         assert_eq!(s[1].onset[0].aspirated, Some(false));
     }
 
