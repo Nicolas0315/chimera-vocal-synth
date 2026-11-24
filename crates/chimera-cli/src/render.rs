@@ -560,9 +560,21 @@ pub fn notes(ctx: &Ctx, a: &[String]) -> Result<(), String> {
     let input = a.first().ok_or("render notes <in.json> <out> [male|female|child] [--artic tracks.json] [--tele voice.tele]")?;
     let out_name = wav_name(arg(a, 1, "out/notes"));
     let body_name = arg(a, 2, "male");
-    let b = body(body_name)?;
     let text = std::fs::read_to_string(input).map_err(|e| format!("{input}: {e}"))?;
     let j: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{input}: {e}"))?;
+    // "anatomy" overrides the preset body's dimensions (a speaker's fitted vocal tract):
+    // {"scale", "pharynx", "tongueRadius", "lipWidth", "foldLength", "openPhase"}, each optional
+    let mut b = body(body_name)?;
+    if let Some(an) = j.get("anatomy") {
+        let f = |k: &str, d: f64| an.get(k).and_then(|x| x.as_f64()).unwrap_or(d);
+        b.scale = f("scale", b.scale);
+        b.pharynx = f("pharynx", b.pharynx);
+        b.tongue_radius = f("tongueRadius", b.tongue_radius);
+        b.lip_width = f("lipWidth", b.lip_width);
+        b.fold_length = f("foldLength", b.fold_length);
+        b.open_phase = f("openPhase", b.open_phase);
+    }
+    let style = Style::parse(j.get("style"))?;
     let bpm = j["bpm"].as_f64().ok_or("bpm missing")?;
     let vibrato = j["vibrato"].as_f64().unwrap_or(35.0);
     let raw: Vec<[f64; 2]> = serde_json::from_value(j["notes"].clone()).map_err(|e| format!("notes: {e}"))?;
@@ -593,6 +605,10 @@ pub fn notes(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         tension: Some(0.55),
         ..Default::default()
     });
+    v.set_source(&style.source);
+    if !style.base.is_empty() {
+        v.set_articulation(&style.base, None);
+    }
     let (mut t, mut k, mut end) = (t0, 0usize, 0.0f64);
     let mut phrase: Vec<SungNote> = Vec::new();
     let mut start = t;
@@ -600,7 +616,8 @@ pub fn notes(ctx: &Ctx, a: &[String]) -> Result<(), String> {
         if phrase.is_empty() {
             return;
         }
-        let plan = plan_song(phrase, &SongOptions { body: body_name.into(), bpm, t0: start, vibrato, ..Default::default() });
+        let mut plan = plan_song(phrase, &SongOptions { body: body_name.into(), bpm, t0: start, vibrato, ..Default::default() });
+        style.apply(&mut plan.gestures);
         v.schedule(&plan.gestures);
         *end = js_max(*end, plan.end);
         phrase.clear();
@@ -940,4 +957,57 @@ pub fn vowels(ctx: &Ctx, a: &[String]) -> Result<(), String> {
     }
     ctx.write_wav(&wav_name(name), &out)?;
     Ok(())
+}
+
+/// A singing style or language setting on top of the plan (`"style"` in a melody file): the voice
+/// source (`"source"`: a SourcePatch, e.g. pressure, tension, breathiness, fry, roughness,
+/// vibratoRate, brightness), articulators moved by an offset in every gesture that sets them
+/// (`"articOffset"`: {"larynx": -1.0}) or held at a value (`"articSet"`: {"epilarynx": 0.6}), both
+/// also the voice's resting posture between gestures.
+struct Style {
+    source: SourcePatch,
+    offset: Vec<(ArticKey, f64)>,
+    set: Vec<(ArticKey, f64)>,
+    base: chimera::anatomy::human::ArticPatch,
+}
+
+impl Style {
+    fn parse(j: Option<&serde_json::Value>) -> Result<Style, String> {
+        let mut st = Style { source: SourcePatch::default(), offset: vec![], set: vec![], base: Default::default() };
+        let Some(j) = j else { return Ok(st) };
+        if let Some(s) = j.get("source") {
+            st.source = serde_json::from_value(s.clone()).map_err(|e| format!("style.source: {e}"))?;
+        }
+        let keys = |name: &str| -> Result<Vec<(ArticKey, f64)>, String> {
+            let Some(m) = j.get(name).and_then(|m| m.as_object()) else { return Ok(vec![]) };
+            m.iter()
+                .map(|(k, x)| Ok((ArticKey::from_name(k).ok_or(format!("style.{name}: unknown articulator {k}"))?, x.as_f64().ok_or(format!("style.{name}.{k}: not a number"))?)))
+                .collect()
+        };
+        st.offset = keys("articOffset")?;
+        st.set = keys("articSet")?;
+        let neutral = chimera::anatomy::human::NEUTRAL;
+        for (k, d) in &st.offset {
+            st.base.set(*k, neutral.get(*k) + d);
+        }
+        for (k, x) in &st.set {
+            st.base.set(*k, *x);
+        }
+        Ok(st)
+    }
+    fn apply(&self, gestures: &mut [Gesture]) {
+        use chimera::control::score::ControlKey;
+        for g in gestures.iter_mut() {
+            for (k, d) in &self.offset {
+                if let Some(x) = g.targets.get(ControlKey::Artic(*k)) {
+                    g.targets.set(ControlKey::Artic(*k), x + d);
+                }
+            }
+            for (k, x) in &self.set {
+                if g.targets.has(ControlKey::Artic(*k)) {
+                    g.targets.set(ControlKey::Artic(*k), *x);
+                }
+            }
+        }
+    }
 }
