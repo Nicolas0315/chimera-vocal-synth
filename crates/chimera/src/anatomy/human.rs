@@ -1276,7 +1276,8 @@ impl HumanVocalTract {
     /// Epilarynx area profile at s ∈ [0, epiLen].
     pub fn epilarynx_area(&self, a: &HumanArtic, s: f64, epi_len: f64) -> f64 {
         let u = s / epi_len;
-        let vent = 0.95 * (1.0 - 0.75 * clamp(a.ventricular, 0.0, 1.0));
+        // above 1 only while the folds vibrate (VoiceSource::ventricular_vibration), toward closure
+        let vent = 0.95 * (1.0 - 0.75 * clamp(a.ventricular, 0.0, 1.3));
         let top = lerp(1.9, 0.35, clamp(a.epilarynx, 0.0, 1.0));
         // laryngeal ventricle, ventricular folds, then the tube to its top
         // Narrowing holds over the whole tube above the ventricular folds (none of it is wider than

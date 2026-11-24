@@ -5,10 +5,10 @@
 use super::human_airway::HumanAirway;
 use crate::airway::decimator::Decimator;
 use crate::anatomy::geom::Vec2;
-use crate::anatomy::human::{ArticKey, ArticPatch, BODY_MALE, HumanBody, N_ARTIC};
+use crate::anatomy::human::{ArticKey, ArticPatch, BODY_MALE, HumanArtic, HumanBody, N_ARTIC};
 use crate::control::articulators::ArticulatorBank;
 use crate::control::score::{Blended, ControlKey, Gesture, GestureScore, Label, N_CONTROL};
-use crate::math::{PI, clamp, exp, js_max, js_min, js_sign, js_trunc_i32, pow, sqrt, tanh};
+use crate::math::{PI, TAU, clamp, cos, exp, js_max, js_min, js_sign, js_trunc_i32, pow, sqrt, tanh};
 use crate::physics::CM_H2O;
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +40,12 @@ pub struct VoiceSource {
     /// the model can, so there is little room to darken and a lot to brighten.
     #[serde(default = "default_brightness")]
     pub brightness: f64,
+    /// 0..1: the ventricular (false) folds vibrate at half the pitch, closing over every second
+    /// glottal cycle, as in kargyraa and growl (Lindestad et al. 2001, J Voice 15(1): the
+    /// ventricular folds close once per two vocal-fold cycles). 0: they only hold the posture's
+    /// narrowing (the `ventricular` articulator).
+    #[serde(default)]
+    pub ventricular_vibration: f64,
 }
 
 fn default_brightness() -> f64 {
@@ -48,7 +54,7 @@ fn default_brightness() -> f64 {
 
 /// `pressure` 7.2 holds what the folds read in vowels, 7.1-7.2 cmH₂O, once the lungs' port stopped taking
 /// its 0.8 (hill-climb log, experiment 30).
-pub const DEFAULT_SOURCE: VoiceSource = VoiceSource { f0: 110.0, glide: 0.06, pressure: 7.2, breathiness: 0.15, tension: 0.5, fry: 0.0, roughness: 0.1, vibrato_depth: 0.0, vibrato_rate: 6.0, drift: 5.0, voiced: true, brightness: 0.25 };
+pub const DEFAULT_SOURCE: VoiceSource = VoiceSource { f0: 110.0, glide: 0.06, pressure: 7.2, breathiness: 0.15, tension: 0.5, fry: 0.0, roughness: 0.1, vibrato_depth: 0.0, vibrato_rate: 6.0, drift: 5.0, voiced: true, brightness: 0.25, ventricular_vibration: 0.0 };
 
 /// Vocal effort from the lung pressure (cmH₂O). The folds read 0.8 less than the lungs while the
 /// lungs' port took its share, so `(lungs − 3)/10` was this law on the same folds' pressure. The port's fix
@@ -85,6 +91,8 @@ pub struct SourcePatch {
     pub voiced: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brightness: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ventricular_vibration: Option<f64>,
 }
 
 impl SourcePatch {
@@ -96,13 +104,13 @@ impl SourcePatch {
         macro_rules! set {
             ($($f:ident),*) => { $( if let Some(x) = self.$f { s.$f = x; } )* };
         }
-        set!(f0, glide, pressure, breathiness, tension, fry, roughness, vibrato_depth, vibrato_rate, drift, voiced, brightness);
+        set!(f0, glide, pressure, breathiness, tension, fry, roughness, vibrato_depth, vibrato_rate, drift, voiced, brightness, ventricular_vibration);
     }
     pub fn merge(&mut self, o: &SourcePatch) {
         macro_rules! set {
             ($($f:ident),*) => { $( if o.$f.is_some() { self.$f = o.$f; } )* };
         }
-        set!(f0, glide, pressure, breathiness, tension, fry, roughness, vibrato_depth, vibrato_rate, drift, voiced, brightness);
+        set!(f0, glide, pressure, breathiness, tension, fry, roughness, vibrato_depth, vibrato_rate, drift, voiced, brightness, ventricular_vibration);
     }
     pub fn from_source(s: &VoiceSource) -> Self {
         SourcePatch {
@@ -118,6 +126,7 @@ impl SourcePatch {
             drift: Some(s.drift),
             voiced: Some(s.voiced),
             brightness: Some(s.brightness),
+            ventricular_vibration: Some(s.ventricular_vibration),
         }
     }
 }
@@ -236,6 +245,9 @@ pub struct HumanVoice {
     cycle_starts: [usize; 8],
     cycle_idx: usize,
     last_phase: f64,
+    /// glottal cycles counted at the internal rate (their parity paces the ventricular folds)
+    vent_cycles: u64,
+    vent_last_ph: f64,
     out_acc: f64,
     out_count: u32,
     sub: u32,
@@ -304,6 +316,8 @@ impl HumanVoice {
             cycle_starts: [0; 8],
             cycle_idx: 0,
             last_phase: 0.0,
+            vent_cycles: 0,
+            vent_last_ph: 0.0,
             out_acc: 0.0,
             out_count: 0,
             sub: 0,
@@ -441,6 +455,11 @@ impl HumanVoice {
                 net.set_fixed_pressure(lungs, self.p_lung_now + lung_excess * self.lung_flow);
                 let a = self.glottis.next(net.p[sub_node] - net.p[supra]);
                 net.set_port_area(gp, a);
+                let gph = self.glottis.cycle_phase();
+                if gph < self.vent_last_ph {
+                    self.vent_cycles = self.vent_cycles.wrapping_add(1);
+                }
+                self.vent_last_ph = gph;
                 let y = net.step();
                 if self.dec.push(y) {
                     // output sample
@@ -501,6 +520,17 @@ impl HumanVoice {
         }
     }
 
+    /// The posture with the ventricular folds where their half-pitch vibration has them now:
+    /// narrowing beyond the articulator's own, up to near closure, once per two glottal cycles.
+    fn ventricular_cycle(&self, mut x: HumanArtic) -> HumanArtic {
+        let d = self.source.ventricular_vibration;
+        if d > 0.0 {
+            let ph2 = 0.5 * ((self.vent_cycles & 1) as f64 + self.glottis.cycle_phase());
+            x.ventricular += clamp(d, 0.0, 1.0) * 1.3 * 0.5 * (1.0 - cos(TAU * ph2));
+        }
+        x
+    }
+
     /// Control-rate update: articulator dynamics, geometry → areas, breath, pitch.
     fn control(&mut self) {
         let dt = self.ctrl_every as f64 / self.fs;
@@ -545,10 +575,10 @@ impl HumanVoice {
         }
         self.clock += dt;
         // contact constraint on the frame computed anyway; re-apply only if a correction was made
-        let x = self.artic.x;
+        let x = self.ventricular_cycle(self.artic.x);
         self.airway.apply(&x, dt);
         if self.enforce_contacts() {
-            let x = self.artic.x;
+            let x = self.ventricular_cycle(self.artic.x);
             self.airway.reapply(&x);
         }
         self.airway.net.begin_block(self.ctrl_every);
