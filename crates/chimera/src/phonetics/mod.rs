@@ -9,6 +9,7 @@ pub mod beatbox;
 pub mod durations;
 pub mod english;
 pub mod inventory;
+pub mod japanese;
 pub mod ipa;
 pub mod korean;
 pub mod mandarin;
